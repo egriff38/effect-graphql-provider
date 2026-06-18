@@ -37,6 +37,7 @@ export const makeExecutor = <AppR, ReqR, E>(
     );
     const contextValue: RequestContextValue<AppR | ReqR> = {
       runField: (effect) => managed.runPromise(Effect.provideContext(effect, requestContext)),
+      runFieldExit: (effect) => managed.runPromiseExit(Effect.provideContext(effect, requestContext)),
     };
     try {
       return await graphql({

@@ -13,19 +13,28 @@ import { type Executor, makeExecutor } from "./internal/runtime.ts";
 /** The schema-carrying part of an Rpc the constructors read (an `Rpc.make(...)` result fits). */
 export interface RpcSchemas {
   readonly _tag: string;
-  readonly payloadSchema: Schema.Top;
+  readonly payloadSchema: Schema.Codec<unknown>;
   readonly successSchema: Schema.Top;
+  readonly errorSchema: Schema.Top;
 }
+
+/** Run authorization/validation guards (each fails with the field's error) before the body. */
+const withGuards = <A, E, R>(
+  guards: ReadonlyArray<Effect.Effect<void, E, R>> | undefined,
+  body: Effect.Effect<A, E, R>,
+): Effect.Effect<A, E, R> => (guards && guards.length > 0 ? Effect.flatMap(Effect.all(guards), () => body) : body);
 
 /** Declare a root operation (query/mutation field). Source is the root and is unused. */
 export const field = <Args, Success, E, R>(options: {
   readonly rpc: RpcSchemas;
+  readonly guards?: ReadonlyArray<Effect.Effect<void, E, R>>;
   readonly resolve: (args: Args) => Effect.Effect<Success, E, R>;
 }): InternalField<R> => ({
   payloadSchema: options.rpc.payloadSchema,
   successSchema: options.rpc.successSchema,
+  errorSchema: options.rpc.errorSchema,
   // graphql-js provides args matching the payload schema this field was derived from.
-  run: (_source, args) => options.resolve(args as Args),
+  run: (_source, args) => withGuards(options.guards, options.resolve(args as Args)),
 });
 
 /** Layer a relationship field onto `schema` (by its identifier). `self` is the parent. */
@@ -33,6 +42,7 @@ export const augment = <S extends Schema.Top, Args, Success, E, R>(
   schema: S,
   rpc: RpcSchemas,
   impl: (self: S["Type"], args: Args) => Effect.Effect<Success, E, R>,
+  guards?: ReadonlyArray<Effect.Effect<void, E, R>>,
 ): InternalAugment<R> => {
   const identifier = AST.resolveIdentifier(schema.ast);
   if (!identifier) {
@@ -44,8 +54,9 @@ export const augment = <S extends Schema.Top, Args, Success, E, R>(
     field: {
       payloadSchema: rpc.payloadSchema,
       successSchema: rpc.successSchema,
+      errorSchema: rpc.errorSchema,
       // parent and args are provided by the GraphQL executor at the shapes derived here.
-      run: (source, args) => impl(source as S["Type"], args as Args),
+      run: (source, args) => withGuards(guards, impl(source as S["Type"], args as Args)),
     },
   };
 };
