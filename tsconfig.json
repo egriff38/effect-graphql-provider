@@ -11,5 +11,5 @@
     "verbatimModuleSyntax": true,
     "lib": ["ESNext"]
   },
-  "include": ["prototype/derive.ts", "prototype/example.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "prototype/**/*.ts", "vitest.config.ts"]
 }
