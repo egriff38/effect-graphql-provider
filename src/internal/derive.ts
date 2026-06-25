@@ -53,8 +53,17 @@ const structOf = (ast: AST.AST): AST.Objects | undefined => {
 
 /** The `graphql` annotation: overrides for a schema's GraphQL mapping. */
 interface GraphQLAnnotation {
+  /** Override the structural scalar mapping with a custom `GraphQLScalarType`. */
   readonly scalar?: GQL.GraphQLScalarType;
+  /** Mark a `Schema.String` field as the GraphQL `ID` scalar (must apply to a String). */
+  readonly id?: boolean;
+  /** Mark a `Schema.Class` as an interface type (emits `GraphQLInterfaceType` when referenced). */
+  readonly interface?: boolean;
+  /** Schemas (typically other classes) whose interfaces this class implements. */
+  readonly implements?: ReadonlyArray<Schema.Top>;
+  /** Override the derived GraphQL type/field name. */
   readonly name?: string;
+  /** Field-level deprecation reason emitted on the GraphQL field config. */
   readonly deprecationReason?: string;
 }
 const readGraphQL = (ast: AST.AST): GraphQLAnnotation | undefined => AST.resolveAt<GraphQLAnnotation>("graphql")(ast);
@@ -72,8 +81,14 @@ const hasIntCheck = (ast: AST.AST): boolean => (ast.checks ?? []).some(isIntFilt
 
 // Scalars are valid in both input and output positions.
 const scalarFor = (ast: AST.AST): GQL.GraphQLScalarType | undefined => {
-  const custom = readGraphQL(ast)?.scalar;
-  if (custom) return custom;
+  const ann = readGraphQL(ast);
+  if (ann?.scalar) return ann.scalar;
+  if (ann?.id) {
+    if (!AST.isString(ast)) {
+      throw new Error("effect-graphql-provider: `graphql: { id: true }` can only annotate a String schema");
+    }
+    return GQL.GraphQLID;
+  }
   if (AST.isString(ast)) return GQL.GraphQLString;
   if (AST.isBoolean(ast)) return GQL.GraphQLBoolean;
   if (AST.isNumber(ast)) return hasIntCheck(ast) ? GQL.GraphQLInt : GQL.GraphQLFloat;
@@ -111,6 +126,8 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
   for (const aug of input.augmentations) {
     idToAugments.set(aug.identifier, [...(idToAugments.get(aug.identifier) ?? []), aug]);
   }
+  const interfaceCache = new Map<string, GQL.GraphQLInterfaceType>();
+  const implementersByInterface = new Map<string, Set<GQL.GraphQLObjectType<unknown, RequestContextValue<R>>>>();
   const enumCache = new Map<string, GQL.GraphQLEnumType>();
   const enumFor = (ast: AST.Union): GQL.GraphQLEnumType => {
     const name = AST.resolveIdentifier(ast);
@@ -128,15 +145,30 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
     return enumType;
   };
 
+  /**
+   * Unwrap an optional Union (the wrapper added by `Schema.optional(X)`):
+   * `Union<X, Undefined>` → `X`. The caller's `withNull{,Input}` reads
+   * `ast.context?.isOptional` separately, so nullability stays correct.
+   * Returns the original AST unchanged when there is no Undefined member
+   * to strip, or when stripping would leave more than one member (an edge
+   * case we don't try to handle).
+   */
+  const unwrapOptional = (ast: AST.AST): AST.AST => {
+    if (!AST.isUnion(ast)) return ast;
+    const non = ast.types.filter((t) => !AST.isUndefined(t));
+    return non.length === 1 ? non[0] : ast;
+  };
+
   const inputType = (ast: AST.AST): GQL.GraphQLInputType => {
-    const scalar = scalarFor(ast);
+    const a = unwrapOptional(ast);
+    const scalar = scalarFor(a);
     if (scalar) return scalar;
-    if (isStringLiteralUnion(ast)) return enumFor(ast);
-    if (AST.isArrays(ast)) return new GQL.GraphQLList(withNullInput(inputType(ast.rest[0]), ast.rest[0]));
-    if (AST.isSuspend(ast)) return inputType(ast.thunk());
-    const struct = structOf(ast);
-    if (struct) return inputObjectFor(ast, struct);
-    throw new Error(`effect-graphql-provider: unsupported input ast '${ast._tag}'`);
+    if (isStringLiteralUnion(a)) return enumFor(a);
+    if (AST.isArrays(a)) return new GQL.GraphQLList(withNullInput(inputType(a.rest[0]), a.rest[0]));
+    if (AST.isSuspend(a)) return inputType(a.thunk());
+    const struct = structOf(a);
+    if (struct) return inputObjectFor(a, struct);
+    throw new Error(`effect-graphql-provider: unsupported input ast '${a._tag}'`);
   };
 
   const inputObjectCache = new Map<string, GQL.GraphQLInputObjectType>();
@@ -163,15 +195,16 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
   };
 
   const outputType = (ast: AST.AST): GQL.GraphQLOutputType => {
-    const scalar = scalarFor(ast);
+    const a = unwrapOptional(ast);
+    const scalar = scalarFor(a);
     if (scalar) return scalar;
-    if (isStringLiteralUnion(ast)) return enumFor(ast);
-    if (isObjectUnion(ast)) return unionFor(ast);
-    if (AST.isArrays(ast)) return new GQL.GraphQLList(withNull(outputType(ast.rest[0]), ast.rest[0]));
-    if (AST.isSuspend(ast)) return outputType(ast.thunk());
-    const struct = structOf(ast);
-    if (struct) return objectTypeFor(ast, struct);
-    throw new Error(`effect-graphql-provider: unsupported output ast '${ast._tag}'`);
+    if (isStringLiteralUnion(a)) return enumFor(a);
+    if (isObjectUnion(a)) return unionFor(a);
+    if (AST.isArrays(a)) return new GQL.GraphQLList(withNull(outputType(a.rest[0]), a.rest[0]));
+    if (AST.isSuspend(a)) return outputType(a.thunk());
+    const struct = structOf(a);
+    if (struct) return objectTypeFor(a, struct);
+    throw new Error(`effect-graphql-provider: unsupported output ast '${a._tag}'`);
   };
 
   const fieldFromInternal = (
@@ -211,6 +244,47 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
     };
   };
 
+  const interfaceTypeFor = (
+    nameAst: AST.AST,
+    struct: AST.Objects,
+  ): GQL.GraphQLInterfaceType => {
+    const name = AST.resolveIdentifier(nameAst);
+    if (!name) throw new Error("effect-graphql-provider: interface schema has no `identifier` annotation");
+    const hit = interfaceCache.get(name);
+    if (hit) return hit;
+    const iface = new GQL.GraphQLInterfaceType({
+      name,
+      description: AST.resolveDescription(nameAst),
+      fields: () => {
+        const fields: GQL.GraphQLFieldConfigMap<unknown, RequestContextValue<R>> = {};
+        for (const ps of struct.propertySignatures) {
+          const fname = String(ps.name);
+          fields[fname] = {
+            type: withNull(outputType(ps.type), ps.type),
+            description: AST.resolveDescription(ps.type),
+            deprecationReason: readGraphQL(ps.type)?.deprecationReason,
+          };
+        }
+        return fields;
+      },
+      // Discriminate concrete types by `_tag` — implementers should be `Schema.TaggedClass`
+      // (or any class whose instances carry a string `_tag`). Returning `undefined` lets
+      // graphql-js fall back to each object type's own `isTypeOf`.
+      resolveType: (value: unknown) => {
+        const tag = readTag(value);
+        if (tag === undefined) return undefined;
+        const implementers = implementersByInterface.get(name);
+        if (!implementers) return undefined;
+        for (const impl of implementers) {
+          if (impl.name === tag) return impl.name;
+        }
+        return undefined;
+      },
+    });
+    interfaceCache.set(name, iface);
+    return iface;
+  };
+
   const objectTypeFor = (
     nameAst: AST.AST,
     struct: AST.Objects,
@@ -220,6 +294,27 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
     const hit = cache.get(name);
     if (hit) return hit;
     materialized.add(name);
+    // Resolve any `implements: [...]` interface annotations.
+    const ann = readGraphQL(nameAst);
+    const interfaces: Array<GQL.GraphQLInterfaceType> = [];
+    if (ann?.implements) {
+      for (const ifaceSchema of ann.implements) {
+        const ifaceAst = ifaceSchema.ast;
+        const ifaceStruct = structOf(ifaceAst);
+        if (!ifaceStruct) {
+          throw new Error(
+            `effect-graphql-provider: 'implements' entry for '${name}' is not a class/struct schema`,
+          );
+        }
+        const ifaceAnn = readGraphQL(ifaceAst);
+        if (!ifaceAnn?.interface) {
+          throw new Error(
+            `effect-graphql-provider: 'implements' entry on '${name}' references a schema without 'graphql: { interface: true }'`,
+          );
+        }
+        interfaces.push(interfaceTypeFor(ifaceAst, ifaceStruct));
+      }
+    }
     const augs = idToAugments.get(name) ?? [];
     const type = new GQL.GraphQLObjectType<unknown, RequestContextValue<R>>({
       name,
@@ -247,8 +342,17 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
         }
         return fields;
       },
+      ...(interfaces.length > 0
+        ? { interfaces, isTypeOf: (value: unknown) => readTag(value) === name }
+        : {}),
     });
     cache.set(name, type);
+    // Register self as implementer of every declared interface.
+    for (const iface of interfaces) {
+      const set = implementersByInterface.get(iface.name) ?? new Set<GQL.GraphQLObjectType<unknown, RequestContextValue<R>>>();
+      set.add(type);
+      implementersByInterface.set(iface.name, set);
+    }
     return type;
   };
 
@@ -339,9 +443,17 @@ export function deriveSchema<R>(input: DeriveInput<R>): GQL.GraphQLSchema {
       },
     });
 
+  // Collect interface implementers so graphql-js can discover them even when
+  // a field only names the interface. Without this, abstract-type resolution
+  // is limited to types reachable through concrete fields.
+  const interfaceImplementerTypes = new Set<GQL.GraphQLObjectType<unknown, RequestContextValue<R>>>();
+  for (const set of implementersByInterface.values()) {
+    for (const t of set) interfaceImplementerTypes.add(t);
+  }
   const schema = new GQL.GraphQLSchema({
     query: rootType("Query", input.query),
     mutation: input.mutation ? rootType("Mutation", input.mutation) : undefined,
+    ...(interfaceImplementerTypes.size > 0 ? { types: [...interfaceImplementerTypes] } : {}),
   });
 
   const missing = [...idToAugments.keys()].filter((id) => !materialized.has(id));
